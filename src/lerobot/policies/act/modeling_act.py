@@ -62,8 +62,6 @@ class ACTPolicy(PreTrainedPolicy):
 
         self.model = ACT(config)
 
-        self.last_action = None # 用于跟踪上一时刻执行的动作
-
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
@@ -95,175 +93,32 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
-            # 关键修改：扩大 buffer，给插值和滤波留空间 cyw
-            self._action_queue = deque([], maxlen=2 * self.config.n_action_steps)
-            self.last_action_list = []      # 保存上一轮整条预测轨迹（边界用）
-            self.last_action = None         # 上一个执行动作（跳变检测用）
+            self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
-    # @torch.no_grad()
-    # def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-    #     """Select a single action given environment observations.
-
-    #     This method wraps `select_actions` in order to return one action at a time for execution in the
-    #     environment. It works by managing the actions in a queue and only calling `select_actions` when the
-    #     queue is empty.
-    #     """
-    #     self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
-
-    #     if self.config.temporal_ensemble_coeff is not None:
-    #         actions = self.predict_action_chunk(batch)
-    #         action = self.temporal_ensembler.update(actions)
-    #         return action
-
-    #     # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-    #     # querying the policy.
-    #     if len(self._action_queue) == 0:
-    #         actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-
-    #         # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-    #         # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-    #         self._action_queue.extend(actions.transpose(0, 1))
-    #     return self._action_queue.popleft()
-    
-    #cyw
-    # @torch.no_grad()
-    # def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-    #         """Select a single action given environment observations.
-
-    #         This method wraps `select_actions` in order to return one action at a time for execution in the
-    #         environment. It works by managing the actions in a queue and only calling `select_actions` when the
-    #         queue is empty.
-    #         """
-    #         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
-
-    #         if self.config.temporal_ensemble_coeff is not None:
-    #             actions = self.predict_action_chunk(batch)
-    #             action = self.temporal_ensembler.update(actions)
-    #             # 记录最后一次执行的动作，供后续可能切换模式时使用
-    #             self.last_action = action 
-    #             return action
-
-    #         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-    #         # querying the policy.
-    #         if len(self._action_queue) == 0:
-    #             # actions shape: (batch_size, n_action_steps, action_dim)
-    #             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-                
-    #             # 安全获取上一时刻执行的动作 (batch_size, action_dim)
-    #             last_action = getattr(self, "last_action", None)
-
-    #             # =================================================================
-    #             # vkrobot 优化 1：跳变点线性插值 (Mutation Filter)
-    #             # =================================================================
-    #             if last_action is not None:
-    #                 first_new_action = actions[:, 0, :]  # 获取新预测序列的第一个动作
-    #                 diff = torch.abs(first_new_action - last_action)
-                    
-    #                 max_increment = 0.06  # 最大允许跳变弧度阈值 (根据你的 SO101 机械臂可微调)
-    #                 max_diff = torch.max(diff).item()
-                    
-    #                 if max_diff > max_increment:
-    #                     # 计算需要插入的点数
-    #                     add_point_num = int(max_diff / max_increment)
-    #                     # 线性插值并存入队列
-    #                     for i in range(1, add_point_num + 1):
-    #                         alpha = i / (add_point_num + 1)
-    #                         interp_action = last_action + (first_new_action - last_action) * alpha
-    #                         # 将插值点以 (batch_size, action_dim) 的形状存入队列
-    #                         self._action_queue.append(interp_action)
-
-    #             # =================================================================
-    #             # vkrobot 优化 2：全序列滑动均值平滑 (Sequence Smoothing)
-    #             # =================================================================
-    #             kernel_size = 5  # 平滑窗口大小 (建议奇数: 3, 5, 7)
-    #             smoothed_actions = actions.clone()
-    #             seq_len = actions.shape[1]
-                
-    #             if last_action is not None:
-    #                 # 为了无缝衔接，将上一帧动作拼接到序列头部: (B, 1, D) + (B, N, D) -> (B, N+1, D)
-    #                 padded_actions = torch.cat([last_action.unsqueeze(1), actions], dim=1)
-    #                 for i in range(seq_len):
-    #                     # 因为有 padding，索引 i 在 padded_actions 中对应 i+1
-    #                     start_idx = max(0, (i + 1) - kernel_size // 2)
-    #                     end_idx = min(seq_len + 1, (i + 1) + kernel_size // 2 + 1)
-    #                     # 计算窗口内的均值
-    #                     smoothed_actions[:, i, :] = torch.mean(padded_actions[:, start_idx:end_idx, :], dim=1)
-    #             else:
-    #                 # 如果没有历史动作，仅对当前序列做内部平滑
-    #                 for i in range(seq_len):
-    #                     start_idx = max(0, i - kernel_size // 2)
-    #                     end_idx = min(seq_len, i + kernel_size // 2 + 1)
-    #                     smoothed_actions[:, i, :] = torch.mean(actions[:, start_idx:end_idx, :], dim=1)
-                
-    #             # 使用平滑后的序列替换原始序列
-    #             actions = smoothed_actions
-
-    #             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-    #             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-    #             self._action_queue.extend(actions.transpose(0, 1))
-            
-    #         # 弹出队列的第一个动作准备执行
-    #         action_to_return = self._action_queue.popleft()
-            
-    #         # === vkrobot 优化：更新状态 ===
-    #         # 记录刚刚执行的动作，为下一次插值和平滑提供参考
-    #         self.last_action = action_to_return 
-            
-    #         return action_to_return
-    
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        self.eval()
+        """Select a single action given environment observations.
+
+        This method wraps `select_actions` in order to return one action at a time for execution in the
+        environment. It works by managing the actions in a queue and only calling `select_actions` when the
+        queue is empty.
+        """
+        self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
-            self.last_action = action.clone()  # 记录
             return action
 
-        # === vkrobot 平滑逻辑 ===
+        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
+        # querying the policy.
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
 
-            # 跳变点线性插值
-            if self.last_action is not None:
-                first_new = actions[:, 0, :]
-                diff = torch.abs(first_new - self.last_action)
-                max_diff = torch.max(diff).item()
-                if max_diff > 0.06:
-                    add_point_num = int(max_diff / 0.06)
-                    for i in range(1, add_point_num + 1):
-                        alpha = i / (add_point_num + 1)
-                        interp = self.last_action + (first_new - self.last_action) * alpha
-                        self._action_queue.append(interp)
-
-            # 全序列滑动均值平滑（改进版：用历史补边界）（修正版：修复索引偏移引起的时序滞后）
-            kernel_size = 5
-            smoothed = actions.clone()
-            seq_len = actions.shape[1]
-
-            if self.last_action is not None:
-                # 拼接后长度变为 seq_len + 1
-                padded = torch.cat([self.last_action.unsqueeze(1), actions], dim=1)
-                for i in range(seq_len):
-                    # 注意：预测序列的第 i 帧，在 padded 中的索引是 i + 1
-                    center_idx = i + 1
-                    start = max(0, center_idx - kernel_size // 2)
-                    end = min(seq_len + 1, center_idx + kernel_size // 2 + 1)
-                    smoothed[:, i, :] = torch.mean(padded[:, start:end, :], dim=1)
-            else:
-                for i in range(seq_len):
-                    start = max(0, i - kernel_size // 2)
-                    end = min(seq_len, i + kernel_size // 2 + 1)
-                    smoothed[:, i, :] = torch.mean(actions[:, start:end, :], dim=1)
-
-            actions = smoothed
-
+            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
-
-        action_to_return = self._action_queue.popleft()
-        self.last_action = action_to_return.clone()  # 更新
-        return action_to_return
+        return self._action_queue.popleft()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -277,7 +132,6 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
-    #cyw
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
@@ -286,33 +140,11 @@ class ACTPolicy(PreTrainedPolicy):
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        # 1. 基础 L1 Loss
         l1_loss = (
             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
 
-        # === 2. 插入 vkrobot 平滑损失逻辑 ===
-        # 使用 1D 卷积模拟均值滤波器
-        kernel_size = 11
-        padding = kernel_size // 2
-        # 调整形状以适配 conv1d: (B, C, T) -> (Batch, Action_dim, Chunk_size)
-        x = actions_hat.transpose(1, 2)
-        # 创建全 1 卷积核并归一化
-        action_dim = x.shape[1]
-        weight = torch.ones(action_dim, 1, kernel_size, device=actions_hat.device) / kernel_size
-        # 分组卷积，确保每个通道独立平滑
-        smoothed_x = F.conv1d(x, weight, padding=padding, groups=action_dim)
-        smoothed_actions = smoothed_x.transpose(1, 2)
-        
-        # 平滑损失：预测值与平滑后的差值
-        smooth_loss = torch.abs(actions_hat - smoothed_actions).mean()
-        # =================================
-
-        # 基础总损失 = 重构损失 + 平滑损失
-        loss = l1_loss + smooth_loss # 加上平滑约束 
-
-        loss_dict = {"l1_loss": l1_loss.item(), "smooth_loss": smooth_loss.item()}
-
+        loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -321,8 +153,10 @@ class ACTPolicy(PreTrainedPolicy):
             mean_kld = (
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
-            loss +=  mean_kld * self.config.kl_weight
             loss_dict["kld_loss"] = mean_kld.item()
+            loss = l1_loss + mean_kld * self.config.kl_weight
+        else:
+            loss = l1_loss
 
         return loss, loss_dict
 

@@ -1099,27 +1099,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.episode_buffer["size"] += 1
 
-    def actions_mean_filtering(self, episode_buffer, mean_num=5):
-        """
-        vkrobot 改进：对采集的动作数据进行滑动窗口均值滤波
-        mean_num: 前后参考的帧数，默认 5 帧（总窗口 11 帧）
-        """
-        if "action" not in episode_buffer:
-            return episode_buffer
-        
-        actions = np.array(episode_buffer["action"])
-        total_frames = actions.shape[0]
-        filtered_actions = np.copy(actions)
-
-        for i in range(total_frames):
-            start = max(0, i - mean_num)
-            end = min(total_frames, i + mean_num + 1)
-            # 计算窗口内的均值
-            filtered_actions[i] = np.mean(actions[start:end], axis=0)
-        
-        episode_buffer["action"] = list(filtered_actions)
-        return episode_buffer
-
     def save_episode(self, episode_data: dict | None = None) -> None:
         """
         This will save to disk the current episode in self.episode_buffer.
@@ -1134,10 +1113,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 None.
         """
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
-
-        # === 插入 vkrobot 逻辑 ===
-        episode_buffer = self.actions_mean_filtering(episode_buffer)
-        # ========================
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
