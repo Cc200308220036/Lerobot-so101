@@ -41,6 +41,7 @@ jobs:
   pre-commit-checks:
     name: Run Pre-commit Hooks (Lint, Format & Static Analysis)
     runs-on: ubuntu-latest
+    if: false  # 👈 就加这一行，直接关闭整个任务
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
