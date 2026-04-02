@@ -212,7 +212,7 @@ class ACTPolicy(PreTrainedPolicy):
     #         return action_to_return
     
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_aselect_actionction(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
 
         if self.config.temporal_ensemble_coeff is not None:

@@ -515,12 +515,35 @@ class SO101Follower(Robot):
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
+        # 读取当前实际位置，由于加入力矩保护，这一步作为必要步骤总是执行  [新增]
+        present_pos = self.bus.sync_read("Present_Position")
+
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
         if self.config.max_relative_target is not None:
-            present_pos = self.bus.sync_read("Present_Position")
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+
+        # 软性过载力矩柔顺保护逻辑 (Torque Compliance Control) [新增开始] 
+        # 读取各个舵机的当前负载量。必须保留原始读取值(normalize=False)，以便接收0-2047的整数状态。
+        # 在Feetech舵机中，第11位（值1024）是代表牵引强度的方向标志位。
+        present_load = self.bus.sync_read("Present_Load", normalize=False)
+        
+        for motor_name, target_val in goal_pos.items():
+            load = present_load[motor_name]
+            # 计算纯净不带方向的绝对阻滞受力大小. (load % 1024) 等价于原本框架旧有的解析方案 [新增]
+            magnitude = load % 1024
+            
+            # 对夹爪应用保护阈值 (120) [新增]
+            if motor_name == "gripper":
+                if magnitude > 120:
+                    # 原理：一旦遇到强阻力，把目标锁定在目前的实际位置上，避免PID继续用力造成破坏
+                    goal_pos[motor_name] = present_pos[motor_name]
+            # 对其他所有身体连杆关节应用更高阈值保护 (800) [新增]
+            else:
+                if magnitude > 800:
+                    goal_pos[motor_name] = present_pos[motor_name]
+        # 软性力矩柔顺保护控制逻辑 [新增结束]
 
         # Send goal position to the arm
         self.bus.sync_write("Goal_Position", goal_pos)
